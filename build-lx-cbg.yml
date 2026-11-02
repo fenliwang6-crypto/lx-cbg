@@ -1,0 +1,118 @@
+name: Build LX Custom Background APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: 检出补丁脚本仓库
+        uses: actions/checkout@v4
+        with:
+          path: self
+
+      - name: 拉取上游源码 lx-music-mobile v1.9.2
+        uses: actions/checkout@v4
+        with:
+          repository: lyswhut/lx-music-mobile
+          ref: v1.9.2
+          path: lx
+
+      - name: 准备 Node 18
+        uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+
+      - name: 准备 JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: 准备 Android SDK 组件
+        shell: bash
+        run: |
+          set +e
+          sdkmanager "platform-tools" "platforms;android-36" "build-tools;35.0.0" "ndk;26.1.10909125" > /dev/null 2>&1
+          echo "sdkmanager exit: $?"
+
+      - name: 应用「自定义背景」补丁
+        shell: bash
+        run: |
+          set -e
+          bash self/build/custom-bg-patch.sh lx
+
+      - name: 安装 npm 依赖
+        shell: bash
+        run: |
+          set -e
+          cd lx
+          npm ci --no-audit --no-fund
+
+      - name: 准备签名密钥（首次自动生成并存入仓库，以后可覆盖升级）
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          if [ -f self/build/keystore.b64 ]; then
+            echo "使用仓库里已有的签名密钥"
+            base64 -d self/build/keystore.b64 > lx/android/app/cbg.keystore
+          else
+            echo "首次构建：生成签名密钥并提交到仓库"
+            keytool -genkeypair -v -keystore lx/android/app/cbg.keystore -alias cbg \
+              -keyalg RSA -keysize 2048 -validity 10950 \
+              -storepass cbg123456 -keypass cbg123456 \
+              -dname "CN=LX Custom Background, O=LX, C=CN"
+            base64 lx/android/app/cbg.keystore | tr -d "\n" > self/build/keystore.b64
+            cd self
+            git config user.name "lx-cbg-bot"
+            git config user.email "lx-cbg-bot@users.noreply.github.com"
+            git add build/keystore.b64
+            git commit -m "chore: 保存签名密钥，保证后续版本可覆盖升级 [skip ci]"
+            git push
+          fi
+
+      - name: 构建并签名 APK
+        shell: bash
+        run: |
+          set -e
+          cd lx/android
+          ./gradlew assembleRelease --no-daemon --stacktrace \
+            -PreactNativeArchitectures=arm64-v8a \
+            -PMYAPP_UPLOAD_STORE_FILE=cbg.keystore \
+            -PMYAPP_UPLOAD_KEY_ALIAS=cbg \
+            -PMYAPP_UPLOAD_STORE_PASSWORD=cbg123456 \
+            -PMYAPP_UPLOAD_KEY_PASSWORD=cbg123456
+          ls -lh app/build/outputs/apk/release/
+
+      - name: 上传 APK（Artifacts）
+        uses: actions/upload-artifact@v4
+        with:
+          name: lx-custom-bg-apk
+          path: lx/android/app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+
+      - name: 发布到 Releases（手机可直接下载）
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -e
+          cd lx/android/app/build/outputs/apk/release
+          TAG="cbg-$(date +%Y%m%d-%H%M%S)"
+          gh release create "$TAG" *.apk \
+            --title "洛雪·自定义背景 $TAG" \
+            --notes "包名 cn.toside.music.mobile.custombg（可与官方洛雪、IKUN 版共存）。arm64 设备专用。"
+          echo "已发布：$TAG"
